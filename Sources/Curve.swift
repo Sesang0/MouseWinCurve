@@ -38,6 +38,9 @@ struct UnlockShortcut {
 /// Keep native event type, source, flags, click count and button identity intact.
 /// Only replace the geometry calculated by the raw-HID pointer pipeline.
 struct PointerEvent {
+    static func isStationaryMove(type:CGEventType,to point:CGPoint,previous:CGPoint) -> Bool {
+        type == .mouseMoved && point == previous
+    }
     static func retarget(_ event: CGEvent, to point: CGPoint, previous: CGPoint) {
         event.location = point
         event.setDoubleValueField(.mouseEventDeltaX, value: point.x - previous.x)
@@ -53,5 +56,43 @@ struct SpeedMath {
     static func league(_ value: Int) -> Double { pow(2,Double(min(100,max(0,value))-50)/25) }
     static func isLeagueGame(bundleID: String?, executable: String?) -> Bool {
         bundleID == "com.riotgames.LeagueofLegends.GameClient" && executable == "LeagueofLegends"
+    }
+}
+
+
+struct LockPolicy {
+    static func waits(onlyGame:Bool,gameForeground:Bool) -> Bool { onlyGame && !gameForeground }
+}
+
+// X and Y elements from one report share a timestamp; count that report once.
+struct HIDRateMeter {
+    private var lastStamp: UInt64?
+    private var lastDevice: UInt64?
+    private(set) var count = 0
+    mutating func record(stamp:UInt64,device:UInt64) {
+        guard lastStamp != stamp || lastDevice != device else { return }
+        lastStamp = stamp; lastDevice = device; count += 1
+    }
+    mutating func sample(elapsed:Double) -> Int {
+        guard elapsed > 0 else { return 0 }
+        let result = Int((Double(count)/elapsed).rounded())
+        count = 0
+        return result
+    }
+}
+
+// Pending run-loop work belongs to exactly one activation. Native-event drains
+// do not release this reservation; only the queued block can do that.
+struct InputSession {
+    private(set) var generation: UInt64 = 0
+    private var queued = false
+    mutating func reset() { generation &+= 1; queued = false }
+    mutating func schedule() -> UInt64? {
+        guard !queued else { return nil }
+        queued = true; return generation
+    }
+    mutating func consume(_ token: UInt64) -> Bool {
+        guard token == generation, queued else { return false }
+        queued = false; return true
     }
 }

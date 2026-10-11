@@ -50,6 +50,7 @@ struct SettingsView: View {
     @AppStorage("logicalWidth") var width = ""
     @AppStorage("logicalHeight") var height = ""
     @AppStorage("enhance") var enhance = true
+    @AppStorage("curveExpanded") private var curveExpanded = false
     @AppStorage("dpiExpanded") private var dpiExpanded = false
     @AppStorage("otherSettingsExpanded") private var otherSettingsExpanded = false
     @ObservedObject var settings: DisplaySettings
@@ -65,7 +66,7 @@ struct SettingsView: View {
                     Text("MouseWinCurve").font(.title2.bold())
                 }
                 Spacer()
-                Text(engine.active ? "잠금 중" : "대기").font(.caption.bold()).padding(8)
+                Text(engine.waitingForGame ? "게임 대기" : (engine.active ? "잠금 중" : "대기")).font(.caption.bold()).padding(8)
                     .background(engine.active ? Color.teal.opacity(0.18) : Color.secondary.opacity(0.12)).clipShape(Capsule())
                 if engine.active { Button("비활성화") { engine.stop() }
                     .buttonStyle(.borderedProminent).tint(Color(red:0.88,green:0.32,blue:0.36)).foregroundColor(.black) }
@@ -118,7 +119,12 @@ struct SettingsView: View {
                     Toggle("02  포인터 정확도 향상",isOn:$enhance).font(.headline).toggleStyle(.switch)
                     Text(enhance ? "첨부 그래프 근사 곡선 · 곡선 배율 × 선택 속도" : "가속 끔 · DPI 비율 × 선택 속도 적용")
                         .font(.subheadline).foregroundStyle(.secondary)
-                    CurveChart(enabled:enhance)
+                    DisclosureGroup(isExpanded:$curveExpanded) {
+                        CurveChart(enabled:enhance).padding(.top,10)
+                    } label: {
+                        Text("가속 그래프").frame(maxWidth:.infinity,alignment:.leading)
+                            .contentShape(Rectangle()).onTapGesture { curveExpanded.toggle() }
+                    }
                     Text("보고 1회당 이동량에 적용합니다. DPI·폴링레이트에 따라 체감이 달라지며 Windows와의 완전한 일치는 보장하지 않습니다.")
                         .font(.caption).foregroundStyle(.secondary)
                 }.padding(8)
@@ -133,6 +139,8 @@ struct SettingsView: View {
             VStack(alignment:.leading,spacing:8) {
                 Label(engine.message,systemImage:engine.active ? "lock.fill" : "info.circle").font(.subheadline)
                     .fixedSize(horizontal:false,vertical:true)
+                Text("수신 이동 보고: \(engine.inputRate) Hz · 장치가 보내는 입력 주기로 처리")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text(engine.diagnostics).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 HStack {
                     Text("현재 배율 \(engine.lastGain,specifier:"%.2f")×")
@@ -238,6 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = mainMenu
         engine.dpiSettings = mice
         engine.speedProfiles = profiles
+        profiles.onLockPolicyChanged = { [weak self] in self?.engine.syncGameLock() }
         mice.onUnavailable = { [weak self] in
             if self?.engine.active == true { self?.engine.stop("마우스 또는 DPI 정보를 사용할 수 없어 잠금을 해제했습니다.") }
         }

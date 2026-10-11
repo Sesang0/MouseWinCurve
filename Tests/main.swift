@@ -83,3 +83,77 @@ let baseSpeed = PointerCurve.advance(.zero,dx:12,dy:5,enabled:true,scaleX:2,scal
 let fastSpeed = PointerCurve.advance(.zero,dx:12,dy:5,enabled:true,scaleX:2,scaleY:2,bounds:speedBounds,speed:2.5)
 near(fastSpeed.x,baseSpeed.x*2.5); near(fastSpeed.y,baseSpeed.y*2.5)
 print("PASS: 11 speed steps, neutral setting, League speed limits, game/client distinction, speed after curve")
+
+for rate in [1000,2000,4000,8000] {
+    var meter = HIDRateMeter()
+    var position = CGPoint.zero
+    let largeBounds = CGRect(x:-1000000,y:-1000000,width:2000000,height:2000000)
+    let perReport = PointerCurve.gain(hypot(2,1))
+    for n in 1...rate {
+        meter.record(stamp:UInt64(n),device:1)
+        meter.record(stamp:UInt64(n),device:1) // Y must not double the measured Hz.
+        position = PointerCurve.advance(position,dx:2,dy:1,enabled:true,scaleX:1,scaleY:1,bounds:largeBounds)
+    }
+    precondition(meter.sample(elapsed:1) == rate)
+    precondition(abs(position.x - Double(rate)*2*perReport) < 0.00001)
+    precondition(abs(position.y - Double(rate)*perReport) < 0.00001)
+    precondition(meter.sample(elapsed:1) == 0)
+}
+precondition(!LockPolicy.waits(onlyGame:false,gameForeground:false))
+precondition(!LockPolicy.waits(onlyGame:false,gameForeground:true))
+precondition(LockPolicy.waits(onlyGame:true,gameForeground:false))
+precondition(!LockPolicy.waits(onlyGame:true,gameForeground:true))
+print("PASS: 1/2/4/8 kHz synthetic report counting, XY deduplication, per-report curve accumulation, idle Hz and game lock policy")
+
+let edgeBounds = CGRect(x:100,y:100,width:800,height:600)
+for pair in [(CGPoint(x:899.5,y:300),2.0,0.0),(CGPoint(x:100,y:300),-2.0,0.0),(CGPoint(x:400,y:100),0.0,-2.0),(CGPoint(x:400,y:699.5),0.0,2.0)] {
+    var p = pair.0
+    for _ in 0..<8000 {
+        let next = PointerCurve.advance(p,dx:pair.1,dy:pair.2,enabled:true,scaleX:2,scaleY:2,bounds:edgeBounds)
+        precondition(PointerEvent.isStationaryMove(type:.mouseMoved,to:next,previous:p))
+        for type in [CGEventType.leftMouseDragged,.rightMouseDragged,.otherMouseDragged,.leftMouseDown,.leftMouseUp] {
+            precondition(!PointerEvent.isStationaryMove(type:type,to:next,previous:p))
+        }
+        p = next
+    }
+    let reverse = PointerCurve.advance(p,dx:-pair.1,dy:-pair.2,enabled:true,scaleX:2,scaleY:2,bounds:edgeBounds)
+    precondition(reverse != p)
+}
+print("PASS: four-edge stationary move suppression, drag/click retention and immediate edge reversal")
+
+let windowFrame = CGRect(x:-500,y:100,width:800,height:600)
+let gameContent = GameWindow.contentBounds(frame:windowFrame,titleBarHeight:28)!
+near(gameContent.minY,128); near(gameContent.maxY,700)
+near(gameContent.minX,-500); near(gameContent.width,800)
+precondition(!gameContent.contains(CGPoint(x:-100,y:110)))
+precondition(GameWindow.contentBounds(frame:windowFrame,titleBarHeight:0) == windowFrame)
+precondition(GameWindow.contentBounds(frame:windowFrame,titleBarHeight:600) == nil)
+precondition(GameWindow.contentBounds(frame:windowFrame,titleBarHeight:-1) == nil)
+print("PASS: game title strip excluded; bottom, width and negative display coordinates preserved")
+
+var session = InputSession()
+let oldWork = session.schedule()!
+precondition(session.schedule() == nil)
+session.reset()
+let newWork = session.schedule()!
+precondition(!session.consume(oldWork))
+precondition(session.schedule() == nil) // stale work must not clear the new reservation
+precondition(session.consume(newWork))
+precondition(!session.consume(newWork))
+for _ in 0..<1000 {
+    let abandoned = session.schedule()!
+    session.reset()
+    precondition(!session.consume(abandoned))
+    let fresh = session.schedule()!
+    precondition(session.consume(fresh))
+}
+print("PASS: repeated reactivation rejects stale drains and preserves new-session scheduling")
+
+var titles = WindowTitleCache()
+precondition(titles.lookup(pid:42,window:10,size:CGSize(width:800,height:600)) == nil)
+titles.store(28)
+for _ in 0..<1000 { near(titles.lookup(pid:42,window:10,size:CGSize(width:800,height:600))!,28) }
+precondition(titles.lookup(pid:42,window:10,size:CGSize(width:900,height:600)) == nil)
+titles.store(32)
+precondition(titles.lookup(pid:42,window:11,size:CGSize(width:900,height:600)) == nil)
+print("PASS: stable window avoids repeated title AX queries; resize and replacement invalidate cache")

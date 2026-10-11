@@ -6,6 +6,25 @@ final class MouseEngine: ObservableObject {
     weak var dpiSettings: MouseCatalog?
     weak var speedProfiles: SpeedProfiles?
     @Published var active = false
+    @Published var waitingForGame = false
+    @Published var inputRate = 0
+    private var reportMeter = HIDRateMeter()
+    private var rateStart = 0.0
+    private var requested: (width:Int,height:Int,display:CGDirectDisplayID,enhanced:Bool)?
+
+    func syncGameLock() {
+        guard active, let config = requested else { return }
+        let shouldWait = speedProfiles?.waitsForGame ?? false
+        if shouldWait && !waitingForGame {
+            stop(nil)
+            requested = config; active = true; waitingForGame = true
+            message = "게임 대기 중 · 화면 제한 없음 · ⌘ Esc로 비활성화"
+        } else if !shouldWait && (waitingForGame || usingFullscreen != (speedProfiles?.leagueFullscreenLock ?? false) || usingWindowFollow != (speedProfiles?.followGameWindow ?? false)) {
+            start(width:config.width,height:config.height,display:config.display,enhanced:config.enhanced)
+        } else if !shouldWait && usingWindowFollow {
+            updateWindowRegion()
+        }
+    }
     @Published var message = "해상도와 포인터 정확도 향상을 설정한 뒤 적용하세요."
     @Published var diagnostics = "아직 적용하지 않았습니다."
     @Published var lastGain = 1.0
@@ -13,6 +32,8 @@ final class MouseEngine: ObservableObject {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var timer: Timer?
+    private var usingWindowFollow = false
+    private var usingFullscreen = false
     private var region = CGRect.zero
     private var position = CGPoint.zero
     private var scaleX = 1.0, scaleY = 1.0
@@ -21,16 +42,51 @@ final class MouseEngine: ObservableObject {
     private var missingSince: Double?
     private var nativeCount = 0
     private var pending: [(stamp: UInt64, device: IOHIDDevice, dx: Double, dy: Double)] = []
-    private var drainScheduled = false
+    private var inputSession = InputSession()
+    private var activationStamp: UInt64 = 0
     private var gain = 1.0
     private var deliveredPosition = CGPoint.zero
     private var observers: [NSObjectProtocol] = []
     private var overlay: NSWindow?
 
     init() {
-        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in self?.stop("화면 구성이 변경되어 잠금을 해제했습니다.") })
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in self?.screenChanged() })
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.stop("잠자기 또는 사용자 전환으로 잠금을 해제했습니다.") })
+        }
+    }
+
+    private func updateWindowRegion() {
+        guard let rect = speedProfiles?.gameWindowBounds,
+              let display = GameWindow.display(for:rect), let mode = CGDisplayCopyDisplayMode(display) else { return }
+        let screen = CGDisplayBounds(display), clipped = rect.intersection(CGDisplayBounds(display))
+        guard !clipped.isNull, clipped.width >= 1, clipped.height >= 1 else { return }
+        scaleX = Double(mode.pixelWidth)/screen.width; scaleY = Double(mode.pixelHeight)/screen.height
+        if region != clipped {
+            region = clipped
+            let previousPosition = position
+            position = PointerCurve.advance(position,dx:0,dy:0,enabled:false,scaleX:scaleX,scaleY:scaleY,bounds:region)
+            overlay?.orderOut(nil); overlay = nil
+            // Do not overlay the game or move the cursor to the center during tracking.
+            diagnostics = "롤 창 추적 · 영역 \(Int(region.width)) × \(Int(region.height))pt"
+            if position != previousPosition {
+                deliveredPosition = position
+                if CGWarpMouseCursorPosition(position) != .success { stop("롤 창의 포인터 위치 변경에 실패했습니다.") }
+            }
+        }
+    }
+
+    private func screenChanged() {
+        guard active, (speedProfiles?.leagueFullscreenLock == true || speedProfiles?.followGameWindow == true), let config = requested else {
+            stop("화면 구성이 변경되어 잠금을 해제했습니다."); return
+        }
+        stop(nil)
+        requested = config; active = true; waitingForGame = true
+        message = "화면 모드 변경 중 · 게임 잠금 재적용 대기"
+        let token = inputSession.generation
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.5) { [weak self] in
+            guard let self, self.inputSession.generation == token else { return }
+            self.syncGameLock()
         }
     }
 
@@ -43,22 +99,39 @@ final class MouseEngine: ObservableObject {
 
     func start(width: Int, height: Int, display: CGDirectDisplayID, enhanced: Bool) {
         stop(nil)
-        guard width >= 64, height >= 64 else { message = "가로·세로는 각각 64pt 이상의 정수여야 합니다."; return }
+        let follow = speedProfiles?.followGameWindow ?? false
+        let originalDisplay = display
+        let display = follow ? (speedProfiles?.gameWindowBounds.flatMap { GameWindow.display(for:$0) } ?? display) : display
+        let fullscreen = (speedProfiles?.leagueFullscreenLock ?? false) || follow
         guard CGDisplayIsActive(display) != 0, let mode = CGDisplayCopyDisplayMode(display) else { message = "선택한 화면을 찾을 수 없습니다."; return }
         let screen = CGDisplayBounds(display)
-        guard Double(width) <= screen.width, Double(height) <= screen.height else {
-            message = "영역이 화면보다 큽니다. 최대 \(Int(screen.width)) × \(Int(screen.height))pt입니다."; return
+        let effectiveWidth = fullscreen ? Int(screen.width) : width
+        let effectiveHeight = fullscreen ? Int(screen.height) : height
+        guard effectiveWidth >= 64, effectiveHeight >= 64,
+              Double(effectiveWidth) <= screen.width, Double(effectiveHeight) <= screen.height else {
+            message = "잠금 영역을 화면 크기 이내로 설정하세요."; return
         }
         guard AXIsProcessTrusted(), CGPreflightListenEventAccess() else {
             message = "적용 불가: 손쉬운 사용 또는 입력 모니터링 권한이 없습니다. 아래 권한 버튼을 누르세요."; return
         }
         guard let dpi = dpiSettings, dpi.selected != 0 else { message = "첫 화면에서 연결된 마우스를 선택하세요."; return }
         guard (speedProfiles.map { $0.ratio(mice:dpi) } ?? dpi.ratio) != nil else { message = "목표 감도를 적용하려면 유효한 현재 DPI가 필요합니다. DPI 창을 확인하세요."; return }
+        requested = (width,height,originalDisplay,enhanced)
+        if speedProfiles?.waitsForGame ?? false {
+            active = true; waitingForGame = true
+            message = "게임 대기 중 · 화면 제한 없음 · ⌘ Esc로 비활성화"
+            diagnostics = "리그오브레전드 실제 게임으로 전환하면 설정한 영역을 적용합니다."
+            return
+        }
+        usingWindowFollow = follow
+        usingFullscreen = speedProfiles?.leagueFullscreenLock ?? false
         self.enhanced = enhanced
         scaleX = Double(mode.pixelWidth)/screen.width
         scaleY = Double(mode.pixelHeight)/screen.height
-        let w = Double(width), h = Double(height)
+        let w = Double(effectiveWidth), h = Double(effectiveHeight)
         region = CGRect(x: screen.midX-w/2, y: screen.midY-h/2, width: w, height: h)
+        pending.reserveCapacity(8192)
+        reportMeter = HIDRateMeter(); rateStart = CACurrentMediaTime()
         let m = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         manager = m
         IOHIDManagerSetDeviceMatching(m, [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Mouse] as CFDictionary)
@@ -67,9 +140,10 @@ final class MouseEngine: ObservableObject {
             guard result == kIOReturnSuccess, let context else { return }
             Unmanaged<MouseEngine>.fromOpaque(context).takeUnretainedValue().receive(value)
         }, ctx)
-        IOHIDManagerRegisterDeviceRemovalCallback(m, { context, _, _, _ in
+        IOHIDManagerRegisterDeviceRemovalCallback(m, { context, _, _, device in
             guard let context else { return }
-            Unmanaged<MouseEngine>.fromOpaque(context).takeUnretainedValue().stop("마우스 연결이 해제되어 잠금을 해제했습니다.")
+            let engine = Unmanaged<MouseEngine>.fromOpaque(context).takeUnretainedValue()
+            if MouseDevice.identifier(device) == engine.dpiSettings?.selected { engine.stop("마우스 연결이 해제되어 잠금을 해제했습니다.") }
         }, ctx)
         IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         let result = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -90,16 +164,20 @@ final class MouseEngine: ObservableObject {
         source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: t, enable: true)
+        if follow, let bounds = speedProfiles?.gameWindowBounds {
+            region = bounds.intersection(screen)
+        }
         position = CGPoint(x: region.midX, y: region.midY)
         deliveredPosition = position
         lastRaw = 0; nativeCount = 0; missingSince = nil
+        activationStamp = mach_absolute_time()
         active = true
         guard CGWarpMouseCursorPosition(position) == .success else { stop("포인터 위치 변경에 실패했습니다."); return }
         // A full-display lock needs no visible boundary.
-        if Double(width) != screen.width || Double(height) != screen.height { showBorder() }
+        if Double(effectiveWidth) != screen.width || Double(effectiveHeight) != screen.height { showBorder() }
         message = "잠금 적용됨 · ⌘ Esc로 즉시 해제"
         let name = dpi.devices.first(where: { $0.id == dpi.selected })?.name ?? "마우스"
-        diagnostics = "연결: \(name)\n영역 \(width) × \(height)pt (현재 화면 배율 기준)"
+        diagnostics = "연결: \(name)\n영역 \(effectiveWidth) × \(effectiveHeight)pt (현재 화면 배율 기준)"
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self, self.active else { return }
             if let t = self.tap, !CGEvent.tapIsEnabled(tap: t) { self.stop("이벤트 제어가 중단되어 안전하게 해제했습니다. 다시 적용하세요."); return }
@@ -108,12 +186,17 @@ final class MouseEngine: ObservableObject {
                 self.stop("포인터 이동은 감지됐지만 원시 HID 입력이 없습니다. 입력 모니터링 권한, 마우스 연결, 다른 마우스 제어 앱을 확인하세요."); return
             }
             self.lastGain = self.gain
+            let now = CACurrentMediaTime()
+            if now-self.rateStart >= 1 {
+                self.inputRate = self.reportMeter.sample(elapsed:now-self.rateStart)
+                self.rateStart = now
+            }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
 
     private func receive(_ value: IOHIDValue) {
-        guard active else { return }
+        guard active, !waitingForGame, IOHIDValueGetTimeStamp(value) >= activationStamp else { return }
         let element = IOHIDValueGetElement(value)
         guard IOHIDElementGetUsagePage(element) == kHIDPage_GenericDesktop,
               IOHIDElementIsRelative(element) else { return }
@@ -122,6 +205,7 @@ final class MouseEngine: ObservableObject {
         dpiSettings?.observeMotion(value)
         let stamp = IOHIDValueGetTimeStamp(value), device = IOHIDElementGetDevice(element)
         guard MouseDevice.identifier(device) == dpiSettings?.selected else { return }
+        reportMeter.record(stamp:stamp,device:MouseDevice.identifier(device))
         let v = Double(IOHIDValueGetIntegerValue(value))
         // Pair X/Y from the same device and report timestamp, without mixing reports.
         if let i = pending.indices.last, pending[i].stamp == stamp, pending[i].device == device {
@@ -130,16 +214,17 @@ final class MouseEngine: ObservableObject {
             pending.append((stamp,device,usage == kHIDUsage_GD_X ? v : 0,usage == kHIDUsage_GD_Y ? v : 0))
         }
         lastRaw = CACurrentMediaTime(); missingSince = nil; nativeCount = 0
-        if !drainScheduled {
-            drainScheduled = true
+        if let token = inputSession.schedule() {
             // Common modes also run during AppKit's modal mouse tracking loop.
-            CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) { [weak self] in self?.drain() }
+            CFRunLoopPerformBlock(CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue) { [weak self] in
+                guard let self, self.inputSession.consume(token) else { return }
+                self.drain()
+            }
             CFRunLoopWakeUp(CFRunLoopGetMain())
         }
     }
 
     private func drain() {
-        drainScheduled = false
         let batch = pending; pending.removeAll(keepingCapacity: true)
         guard active else { return }
         for report in batch {
@@ -149,11 +234,12 @@ final class MouseEngine: ObservableObject {
             let speed = speedProfiles?.speed ?? 1
             gain = ratio * speed * (enhanced ? PointerCurve.gain(hypot(dx, dy)) : 1)
             position = PointerCurve.advance(position, dx: dx, dy: dy, enabled: enhanced, scaleX: scaleX, scaleY: scaleY, bounds: region, speed: speed)
-            guard CGWarpMouseCursorPosition(position) == .success else { stop("포인터 이동 실패로 잠금을 해제했습니다."); return }
             // Native Quartz events are retargeted in filter(). Never synthesize a
             // parallel mouseMoved/drag stream: preserve native drag identity/order.
 
         }
+        // Only calculate here. Cursor writes belong to the native event callback,
+        // so HID delivery and Quartz delivery cannot alternately move the cursor.
     }
 
     private func filter(_ type: CGEventType, _ event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -174,10 +260,18 @@ final class MouseEngine: ObservableObject {
             // Flush available HID reports before forwarding the same native event.
             drain()
             guard active else { return Unmanaged.passUnretained(event) }
+            let stationary = PointerEvent.isStationaryMove(type:type,to:position,previous:deliveredPosition)
+            let nativePosition = event.location
             PointerEvent.retarget(event, to: position, previous: deliveredPosition)
             deliveredPosition = position
-            if CGWarpMouseCursorPosition(position) != .success { stop("포인터 제한 실패로 잠금을 해제했습니다.") }
-            return Unmanaged.passUnretained(event)
+            // One correction per native event, only when the OS position differs.
+            if nativePosition != position, CGWarpMouseCursorPosition(position) != .success {
+                stop("포인터 제한 실패로 잠금을 해제했습니다.")
+                return Unmanaged.passUnretained(event)
+            }
+            // At a clamped edge, do not forward a stream of zero-distance hover moves.
+            // Drag/down/up events always retain their native identity and order.
+            return stationary ? nil : Unmanaged.passUnretained(event)
         }
         drain()
         guard active else { return Unmanaged.passUnretained(event) }
@@ -186,16 +280,26 @@ final class MouseEngine: ObservableObject {
     }
 
     func stop(_ reason: String? = "잠금을 해제했습니다.") {
-        active = false
+        active = false; waitingForGame = false; requested = nil; inputRate = 0
+        // Invalidate old queued drains and delayed screen restarts before teardown.
+        inputSession.reset()
         timer?.invalidate(); timer = nil
         if let tap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         source = nil; tap = nil
         if let manager {
+            IOHIDManagerRegisterInputValueCallback(manager, nil, nil)
+            IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
             IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         }
-        manager = nil; pending.removeAll(); missingSince = nil
+        manager = nil; pending.removeAll(keepingCapacity: true)
+        missingSince = nil; lastRaw = 0; nativeCount = 0; activationStamp = 0
+        reportMeter = HIDRateMeter(); rateStart = 0
+        gain = 1; lastGain = 1
+        position = .zero; deliveredPosition = .zero; region = .zero
+        scaleX = 1; scaleY = 1; enhanced = true
+        usingWindowFollow = false; usingFullscreen = false
         overlay?.orderOut(nil); overlay = nil
         if let reason { message = reason }
     }
